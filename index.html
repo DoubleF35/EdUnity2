@@ -62,10 +62,32 @@
   }
   </script>
   
+  <!-- ═══ ERUDA DEBUG — attivato con 2 tap in basso a sinistra ═══ -->
+  <script>
+  (function(){
+    var taps=0,timer=null;
+    document.addEventListener('touchstart',function(e){
+      var t=e.touches[0];
+      if(t.clientX>120||t.clientY<window.innerHeight-120)return; // solo basso-sinistra
+      taps++;
+      clearTimeout(timer);
+      timer=setTimeout(function(){taps=0;},600);
+      if(taps>=2){
+        taps=0;
+        if(typeof eruda==='undefined'){
+          var s=document.createElement('script');
+          s.src='https://cdn.jsdelivr.net/npm/eruda';
+          s.onload=function(){eruda.init();eruda.show();};
+          document.head.appendChild(s);
+        }else{
+          eruda.show();
+        }
+      }
+    });
+  })();
+  </script>
   <link rel="manifest" id="manifestLink" href="#">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
-  <script>eruda.init();</script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
@@ -1295,7 +1317,12 @@ async function autoTranscribeWithWhisper(){
         else setStatus('done','File troppo grande');
         if(statusEl)statusEl.style.display='none';audioChunks=[];return;
       }
-      if(!r.ok)throw new Error('Errore server '+r.status);
+      if(!r.ok){
+        let errBody='';
+        try{errBody=await r.text();}catch(_){}
+        console.error('[Whisper] server error body:',errBody);
+        throw new Error('Errore server '+r.status+' — '+errBody.slice(0,200));
+      }
 
       const raw=await r.text();
       let text=raw.trim();
