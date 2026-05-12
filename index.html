@@ -2847,7 +2847,7 @@ async function initFCM(){
     if(Notification.permission!=='granted')return;
     const sw=await navigator.serviceWorker.ready;
     const token=await messaging.getToken({
-      vapidKey:'YOUR_VAPID_KEY_HERE', // ← sostituisci con la tua VAPID key da Firebase Console
+      vapidKey:'BKU73aTpMj0a0MXTMl-yNVDl2aFo7W-JrR1bD45V_ATbfNE0w9wBKOlDV_BnldrnTikidW6aCKHrOkp2wIptW0s', // ← sostituisci con la tua VAPID key da Firebase Console
       serviceWorkerRegistration:sw
     });
     if(token&&auth.currentUser){
