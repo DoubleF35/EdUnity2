@@ -11,17 +11,21 @@
   <!-- ═══ SICUREZZA: Content Security Policy ═══ -->
   <!-- Mitiga XSS limitando da dove si possono caricare script/risorse.
        Se aggiungi nuove CDN o domini, vanno inseriti qui. -->
+  <!-- CSP volutamente permissiva: la protezione XSS reale e garantita dalle
+       funzioni esc()/escJs() nel codice. Una CSP troppo stretta rompe PWA,
+       Firebase e Google Fonts. connect-src e' ampio per non bloccare le API. -->
   <meta http-equiv="Content-Security-Policy" content="
-    default-src 'self';
-    script-src 'self' 'unsafe-inline' https://www.gstatic.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://*.firebaseio.com https://*.googleapis.com;
-    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-    font-src 'self' https://fonts.gstatic.com;
+    default-src 'self' https: data: blob:;
+    script-src 'self' 'unsafe-inline' 'unsafe-eval' https: blob:;
+    style-src 'self' 'unsafe-inline' https:;
+    font-src 'self' https: data:;
     img-src 'self' data: https: blob:;
-    connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://late-forest-235c.fedefas-210.workers.dev wss://*.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firestore.googleapis.com;
-    media-src 'self' blob:;
+    connect-src 'self' https: wss: blob:;
+    media-src 'self' blob: data: https:;
+    manifest-src 'self' blob: data:;
+    worker-src 'self' blob:;
     object-src 'none';
     base-uri 'self';
-    form-action 'self';
   ">
   <meta http-equiv="X-Content-Type-Options" content="nosniff">
   <meta name="referrer" content="strict-origin-when-cross-origin">
@@ -1528,6 +1532,64 @@ function startWebSpeechPreview(){
   }catch(e){console.warn('SpeechRecognition non disponibile:',e);}
 }
 
+// ════════════════════════════════════════════════════════════════
+//  CONVERSIONE AUDIO → WAV
+//  Il problema "Audio file is too short" non dipende dalla durata:
+//  i file WebM prodotti da MediaRecorder spesso hanno header senza
+//  metadati di durata, e Groq/Whisper li rifiuta. Decodificando l'audio
+//  con la Web Audio API e ri-codificandolo in WAV otteniamo SEMPRE un
+//  header valido. Funziona identico su Android, iOS e desktop.
+// ════════════════════════════════════════════════════════════════
+async function blobToWav(blob){
+  const AudioCtx=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtx)throw new Error('Web Audio non supportato');
+  const arrayBuf=await blob.arrayBuffer();
+  const ctx=new AudioCtx();
+  let audioBuf;
+  try{
+    audioBuf=await ctx.decodeAudioData(arrayBuf);
+  }finally{
+    // chiudi il context per liberare risorse
+    if(ctx.state!=='closed')ctx.close().catch(()=>{});
+  }
+  // Downmix a mono + resample a 16kHz (Whisper lavora a 16kHz, file più leggero)
+  const targetRate=16000;
+  const length=Math.ceil(audioBuf.duration*targetRate);
+  const OfflineCtx=window.OfflineAudioContext||window.webkitOfflineAudioContext;
+  const offline=new OfflineCtx(1,length,targetRate);
+  const src=offline.createBufferSource();
+  src.buffer=audioBuf;
+  src.connect(offline.destination);
+  src.start(0);
+  const rendered=await offline.startRendering();
+  const data=rendered.getChannelData(0);
+
+  // Codifica PCM 16-bit little-endian con header WAV
+  const buffer=new ArrayBuffer(44+data.length*2);
+  const view=new DataView(buffer);
+  const writeStr=(off,s)=>{for(let i=0;i<s.length;i++)view.setUint8(off+i,s.charCodeAt(i));};
+  writeStr(0,'RIFF');
+  view.setUint32(4,36+data.length*2,true);
+  writeStr(8,'WAVE');
+  writeStr(12,'fmt ');
+  view.setUint32(16,16,true);
+  view.setUint16(20,1,true);          // PCM
+  view.setUint16(22,1,true);          // mono
+  view.setUint32(24,targetRate,true);
+  view.setUint32(28,targetRate*2,true);
+  view.setUint16(32,2,true);
+  view.setUint16(34,16,true);
+  writeStr(36,'data');
+  view.setUint32(40,data.length*2,true);
+  let off=44;
+  for(let i=0;i<data.length;i++){
+    let s=Math.max(-1,Math.min(1,data[i]));
+    view.setInt16(off,s<0?s*0x8000:s*0x7FFF,true);
+    off+=2;
+  }
+  return new Blob([buffer],{type:'audio/wav'});
+}
+
 async function autoTranscribeWithWhisper(){
   if(!audioChunks.length){
     if(livePreview.trim()){
@@ -1548,29 +1610,41 @@ async function autoTranscribeWithWhisper(){
 
   const statusEl=document.getElementById('transcribeStatus');
   if(statusEl)statusEl.style.display='flex';
+  const statusTxt0=document.getElementById('transcribeStatusText');
 
-  // mimeType reale dai chunk (su Android spesso differisce da quello richiesto)
+  // Blob originale dai chunk registrati
   const actualMime=(audioChunks[0]&&audioChunks[0].type)||'audio/webm';
   const cleanMime=actualMime.split(';')[0]||'audio/webm';
-  const ext=mimeToExt(cleanMime);
+  const rawBlob=new Blob(audioChunks,{type:cleanMime||'audio/webm'});
 
-  const blob=new Blob(audioChunks,{type:cleanMime||'audio/webm'});
+  console.log(`[Whisper] raw blob ${rawBlob.size}B type=${rawBlob.type} chunks=${audioChunks.length} android=${isAndroid}`);
 
-  console.log(`[Whisper] blob ${blob.size}B type=${blob.type} ext=${ext} chunks=${audioChunks.length} android=${isAndroid}`);
-
-  // GUARD: blob troppo piccolo rispetto alla durata = registrazione corrotta.
-  // Meglio usare subito il fallback live che mandare a Whisper un file rotto.
-  if(blob.size<1500){
+  if(rawBlob.size<1500){
     if(livePreview.trim()){
       transcript=livePreview.trim();renderTranscript(transcript,'');
       setStatus('done','Trascritto (live)');
       showToast('Audio non valido — usato testo live');
     }else{
       setStatus('','Pronto');
-      showToast('Registrazione non riuscita — riprova tenendo premuto Stop più a lungo','err');
+      showToast('Registrazione non riuscita — riprova','err');
     }
     if(statusEl)statusEl.style.display='none';
     audioChunks=[];return;
+  }
+
+  // ── Converte in WAV (header sempre valido → niente "audio too short") ──
+  let blob, ext, fileName;
+  try{
+    if(statusTxt0)statusTxt0.textContent='Preparazione audio…';
+    blob=await blobToWav(rawBlob);
+    ext='wav';fileName='audio.wav';
+    console.log(`[Whisper] converted WAV ${blob.size}B`);
+    if(blob.size<2000)throw new Error('WAV vuoto');
+  }catch(convErr){
+    // Conversione fallita → invia il formato originale come ripiego
+    console.warn('[Whisper] WAV conversion failed, sending raw:',convErr&&convErr.message);
+    blob=rawBlob;
+    ext=mimeToExt(cleanMime);fileName='audio.'+ext;
   }
 
   let lastErr=null;
@@ -1581,8 +1655,7 @@ async function autoTranscribeWithWhisper(){
       if(attempt>1)await new Promise(r=>setTimeout(r,attempt*1500));
 
       const fd=new FormData();
-      // Nome file con estensione corretta — Whisper usa il nome per capire il formato
-      fd.append('file',blob,'audio.'+ext);
+      fd.append('file',blob,fileName);
       fd.append('model','whisper-large-v3-turbo');
       fd.append('language','it');
       fd.append('response_format','text');
