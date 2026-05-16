@@ -1,56 +1,108 @@
-// EdUnity Service Worker — Modalità Offline v1
-const CACHE = 'edunity-v2';
-const STATIC = ['/', '/index.html', '/icon-192.png', '/icon-512.png', '/logo.png', '/riccio.png'];
+// ═══════════════════════════════════════════════════════════════════
+//  EdUnity — Service Worker
+//
+//  IMPORTANTE: ad OGNI modifica del sito, incrementa il numero di
+//  versione qui sotto (es. v3, v4...). È questo cambiamento che dice
+//  al browser "c'è una versione nuova, scaricala".
+// ═══════════════════════════════════════════════════════════════════
+const VERSION = 'edunity-v3';
+const CACHE = VERSION;
 
-self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {})));
-  self.skipWaiting();
-});
+// File di base da avere disponibili offline
+const CORE_ASSETS = [
+  '/',
+  '/index.html',
+  '/logo.png',
+  '/riccio.png',
+  '/manifest.json'
+];
 
-self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(keys =>
-    Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-  ));
-  self.clients.claim();
-});
-
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  if (url.hostname.includes('googleapis.com') ||
-      url.hostname.includes('firebaseio.com') ||
-      url.hostname.includes('workers.dev') ||
-      url.hostname.includes('gstatic.com')) return;
-
-  e.respondWith(
-    caches.match(e.request).then(cached => {
-      if (cached) return cached;
-      return fetch(e.request).then(res => {
-        if (e.request.method === 'GET' && res?.status === 200 && res.type !== 'opaque') {
-          const clone = res.clone();
-          caches.open(CACHE).then(c => c.put(e.request, clone));
-        }
-        return res;
-      }).catch(() => {
-        if (e.request.mode === 'navigate') return caches.match('/index.html');
-        return new Response('Offline', { status: 503 });
-      });
-    })
+// ── INSTALL: precarica i file di base ──────────────────────────────
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE).then(c => c.addAll(CORE_ASSETS).catch(() => {}))
   );
 });
 
-self.addEventListener('push', e => {
-  const data = e.data?.json() || {};
-  const n = data.notification || {};
-  e.waitUntil(self.registration.showNotification(n.title || 'EdUnity', {
-    body: n.body || '', icon: '/icon-192.png', badge: '/icon-192.png',
-    tag: 'edunity-push', renotify: true
-  }));
+// ── ACTIVATE: elimina tutte le cache vecchie ───────────────────────
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(
+        keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
+  );
 });
 
-self.addEventListener('notificationclick', e => {
-  e.notification.close();
-  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(ws => {
-    if (ws.length) return ws[0].focus();
-    return clients.openWindow('/');
-  }));
+// ── Messaggio dalla pagina: attiva subito il nuovo SW ──────────────
+self.addEventListener('message', event => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
+// ── FETCH ──────────────────────────────────────────────────────────
+// Strategia:
+//  • HTML / navigazione  → NETWORK FIRST (prendi sempre la versione
+//    nuova dal server; usa la cache solo se sei offline). È QUESTO
+//    che risolve il problema della "versione vecchia".
+//  • Altri asset (img, css, font) → CACHE FIRST con aggiornamento in
+//    background, per velocità.
+//  • Chiamate a Firebase / API / Google → SEMPRE rete, mai cache.
+self.addEventListener('fetch', event => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+
+  // Non intercettare mai chiamate dinamiche/esterne
+  const bypass = [
+    'firestore.googleapis.com',
+    'firebaseio.com',
+    'firebasedatabase.app',
+    'identitytoolkit.googleapis.com',
+    'securetoken.googleapis.com',
+    'googleapis.com',
+    'gstatic.com',
+    'workers.dev'
+  ];
+  if (bypass.some(h => url.hostname.includes(h))) return;
+
+  const isHTML =
+    req.mode === 'navigate' ||
+    req.destination === 'document' ||
+    (req.headers.get('accept') || '').includes('text/html');
+
+  if (isHTML) {
+    // NETWORK FIRST per l'HTML
+    event.respondWith(
+      fetch(req)
+        .then(res => {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put('/index.html', copy)).catch(() => {});
+          return res;
+        })
+        .catch(() =>
+          caches.match(req).then(r => r || caches.match('/index.html'))
+        )
+    );
+    return;
+  }
+
+  // CACHE FIRST per gli altri asset, con refresh in background
+  event.respondWith(
+    caches.match(req).then(cached => {
+      const network = fetch(req)
+        .then(res => {
+          if (res && res.status === 200 && res.type === 'basic') {
+            const copy = res.clone();
+            caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
+          }
+          return res;
+        })
+        .catch(() => cached);
+      return cached || network;
+    })
+  );
 });
