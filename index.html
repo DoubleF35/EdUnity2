@@ -22,7 +22,6 @@
     object-src 'none';
     base-uri 'self';
     form-action 'self';
-    frame-ancestors 'none';
   ">
   <meta http-equiv="X-Content-Type-Options" content="nosniff">
   <meta name="referrer" content="strict-origin-when-cross-origin">
@@ -1195,9 +1194,10 @@ async function doResetPassword(){const e=document.getElementById('resetEmail').v
 function showAuthError(id,msg){const el=document.getElementById(id);el.style.display='block';el.textContent=msg}
 async function doLogout(){
   const u=auth.currentUser;
+  if(window._userHb)clearInterval(window._userHb);
+  if(window._guestHb)clearInterval(window._guestHb);
   if(u){
     try{await rtdb.ref('presence/'+u.uid).remove();}catch(e){}
-    try{await rtdb.ref('online/'+u.uid).remove();}catch(e){}
   }
   await auth.signOut();
   showToast('Logout effettuato');
@@ -1257,14 +1257,22 @@ auth.onAuthStateChanged(u=>{
 function setupGuestPresence(){
   let sid=sessionStorage.getItem('edunity_sid');
   if(!sid){sid='g_'+Math.random().toString(36).slice(2,10);sessionStorage.setItem('edunity_sid',sid);}
-  const ref=rtdb.ref('presence/'+sid);
-  rtdb.ref('.info/connected').on('value',snap=>{
-    if(snap.val()===true){
-      ref.set({type:'guest',ts:firebase.database.ServerValue.TIMESTAMP})
-        .catch(e=>console.warn('Guest presence write failed:',e.code));
-      ref.onDisconnect().remove();
-    }
-  });
+  try{
+    const ref=rtdb.ref('presence/'+sid);
+    rtdb.ref('.info/connected').on('value',snap=>{
+      if(snap.val()===true){
+        ref.onDisconnect().remove();
+        ref.set({t:'g',ts:firebase.database.ServerValue.TIMESTAMP})
+          .catch(e=>console.warn('[presence] guest write failed:',e&&e.code));
+      }
+    });
+    // Heartbeat: rinfresca il timestamp ogni 45s così le sessioni morte si possono filtrare
+    if(window._guestHb)clearInterval(window._guestHb);
+    window._guestHb=setInterval(()=>{
+      ref.update({ts:firebase.database.ServerValue.TIMESTAMP}).catch(()=>{});
+    },45000);
+  }catch(e){console.warn('[presence] guest setup error',e);}
+  updateOnlineCounter();
 }
 
 async function checkAndShowProfileSetup(u){
@@ -1272,42 +1280,56 @@ async function checkAndShowProfileSetup(u){
   try{
     const doc=await db.collection('user_profiles').doc(u.uid).get();
     const data=doc.exists?doc.data():{};
-    // Se mancano scuola O anno, mostra il popup obbligatorio
     if(!data.school||!data.birthYear){
       showProfileSetupPopup(u, data);
     }
   }catch(e){/* silent fail */}
 }
+
 function setupPresence(u){
-  const presRef=rtdb.ref('presence/'+u.uid);
-  rtdb.ref('.info/connected').on('value',snap=>{
-    if(snap.val()===true){
-      presRef.set({
-        type:'user',name:u.displayName||'Studente',
-        ts:firebase.database.ServerValue.TIMESTAMP
-      }).catch(e=>console.warn('User presence write failed:',e.code));
-      presRef.onDisconnect().remove();
-    }
-  });
+  try{
+    const presRef=rtdb.ref('presence/'+u.uid);
+    rtdb.ref('.info/connected').on('value',snap=>{
+      if(snap.val()===true){
+        presRef.onDisconnect().remove();
+        presRef.set({
+          t:'u',
+          n:(u.displayName||'Studente').slice(0,40),
+          ts:firebase.database.ServerValue.TIMESTAMP
+        }).catch(e=>console.warn('[presence] user write failed:',e&&e.code,'→ controlla le RTDB Rules'));
+      }
+    });
+    if(window._userHb)clearInterval(window._userHb);
+    window._userHb=setInterval(()=>{
+      presRef.update({ts:firebase.database.ServerValue.TIMESTAMP}).catch(()=>{});
+    },45000);
+  }catch(e){console.warn('[presence] user setup error',e);}
 }
+
 function updateOnlineCounter(){
-  rtdb.ref('presence').on('value',snap=>{
-    const data=snap.val();
-    const count=data?Object.keys(data).length:0;
-    const el=document.getElementById('onlineCounterHeader');
-    if(!el)return;
-    if(count>0){
-      el.innerHTML=`<span style="color:var(--green)">●</span><span style="font-weight:600">${count} online</span>`;
-      el.title=Object.values(data).map(v=>v.name||'Ospite').join(', ');
-    }else{
-      el.innerHTML=`<span style="color:var(--muted)">○</span><span>0 online</span>`;
-      el.title='';
-    }
-  },err=>{
-    console.warn('RTDB presence read error:',err.code,'→ controlla le RTDB Rules');
-    const el=document.getElementById('onlineCounterHeader');
-    if(el)el.innerHTML=`<span style="color:var(--muted)">○</span><span style="font-size:.65rem">–</span>`;
-  });
+  const el=document.getElementById('onlineCounterHeader');
+  try{
+    rtdb.ref('presence').on('value',snap=>{
+      const data=snap.val()||{};
+      // Conta solo sessioni con heartbeat negli ultimi 2 minuti (filtra i fantasmi)
+      const now=Date.now();
+      let count=0;
+      Object.keys(data).forEach(k=>{
+        const v=data[k];
+        const ts=v&&typeof v.ts==='number'?v.ts:now;
+        if(now-ts<120000)count++;
+      });
+      if(!el)return;
+      if(count>0){
+        el.innerHTML='<span style="color:var(--green)">●</span><span style="font-weight:600">'+count+(count===1?' online':' online')+'</span>';
+      }else{
+        el.innerHTML='<span style="color:var(--muted)">○</span><span>0 online</span>';
+      }
+    },err=>{
+      console.warn('[presence] read error:',err&&err.code,'→ le RTDB Rules bloccano la lettura di /presence');
+      if(el)el.innerHTML='<span style="color:var(--muted)">○</span><span style="font-size:.65rem">offline</span>';
+    });
+  }catch(e){console.warn('[presence] counter error',e);}
 }
 
 // NAVIGATION
@@ -1333,11 +1355,11 @@ const isIOS=/iPad|iPhone|iPod/i.test(navigator.userAgent);
 
 // ── Sceglie il miglior MIME type per la piattaforma ──
 function getBestMime(){
-  // Android Chrome: webm/opus è supportato ma a volte restituisce blob vuoti
-  // Ordine testato: opus è il più compatibile con Whisper
+  if(typeof MediaRecorder==='undefined'||!MediaRecorder.isTypeSupported)return '';
+  // iOS: solo mp4/aac. Android/desktop: webm/opus è il più compatibile con Whisper.
   const candidates=isIOS
-    ? ['audio/mp4','audio/aac','audio/webm','']
-    : ['audio/webm;codecs=opus','audio/ogg;codecs=opus','audio/webm','audio/ogg','audio/mp4',''];
+    ? ['audio/mp4','audio/aac','audio/mpeg','']
+    : ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/ogg','audio/mp4',''];
   return candidates.find(m=>m===''||MediaRecorder.isTypeSupported(m))||'';
 }
 
@@ -1353,27 +1375,32 @@ function mimeToExt(mime){
 function toggleRecord(){micState==='idle'||micState==='stopped'?startRecord():micState==='recording'?pauseRecord():resumeRecord()}
 
 async function startRecord(){
+  if(typeof MediaRecorder==='undefined'){
+    showToast('Registrazione non supportata da questo browser','err');return;
+  }
   try{
-    // Non forzare sampleRate su Android — lascia che il browser scelga
-    const constraints=isAndroid
-      ? {audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}}
-      : {audio:{echoCancellation:true,noiseSuppression:true,channelCount:1,sampleRate:16000}};
-    micStream=await navigator.mediaDevices.getUserMedia(constraints);
+    // Vincoli minimi e sicuri — lasciamo che il browser scelga sampleRate/codec.
+    // Forzare sampleRate rompe la registrazione su molti Android.
+    micStream=await navigator.mediaDevices.getUserMedia({
+      audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+    });
   }catch(e){
-    showToast('Microfono non disponibile: '+e.message,'err');
+    const msg=e.name==='NotAllowedError'
+      ? 'Permesso microfono negato. Abilitalo nelle impostazioni del browser.'
+      : 'Microfono non disponibile: '+(e.message||e.name);
+    showToast(msg,'err');
     return;
   }
   audioChunks=[];livePreview='';
   const mime=getBestMime();
   try{
-    mediaRecorder=new MediaRecorder(micStream,mime?{mimeType:mime}:{});
+    mediaRecorder=mime?new MediaRecorder(micStream,{mimeType:mime}):new MediaRecorder(micStream);
   }catch(e){
     try{mediaRecorder=new MediaRecorder(micStream);}
-    catch(e2){showToast('Registrazione non supportata su questo dispositivo','err');return;}
+    catch(e2){showToast('Registrazione non supportata su questo dispositivo','err');
+      micStream.getTracks().forEach(t=>t.stop());return;}
   }
 
-  // Su Android raccogliamo chunk più frequentemente (250ms) per evitare blob vuoti allo stop
-  const chunkInterval=isAndroid?250:500;
   mediaRecorder.ondataavailable=e=>{
     if(e.data&&e.data.size>0)audioChunks.push(e.data);
   };
@@ -1382,7 +1409,16 @@ async function startRecord(){
     showToast('Errore registrazione — riprova','err');
     stopRecord();
   };
-  mediaRecorder.start(chunkInterval);
+  // FIX ANDROID FONDAMENTALE: NON usare timeslice.
+  // mediaRecorder.start(250) su Android Chrome/Samsung produce blob WebM con
+  // header frammentati che Whisper non riesce a decodificare. Senza argomento,
+  // il browser accumula tutto e rilascia UN unico blob valido a .stop().
+  try{
+    mediaRecorder.start();
+  }catch(e){
+    showToast('Impossibile avviare la registrazione','err');
+    micStream.getTracks().forEach(t=>t.stop());return;
+  }
   micState='recording';updateRecUI();startTimer();setStatus('rec','Registrazione');
   requestWakeLock();
   startWebSpeechPreview();
@@ -1391,15 +1427,10 @@ async function startRecord(){
 function pauseRecord(){
   micState='paused';
   if(recognition){try{recognition.stop();}catch(e){}}
-  // FIX ANDROID: NON fermiamo il MediaRecorder su Android.
-  // Fermare e ricreare produce WebM con header multipli non concatenabili → Whisper fallisce.
-  // Su Android "pausiamo" solo il timer e l'UI, la registrazione audio continua.
+  // Senza timeslice, pause()/resume() nativi funzionano in modo affidabile
+  // su tutte le piattaforme, Android incluso. Il buffer audio resta intatto.
   if(mediaRecorder&&mediaRecorder.state==='recording'){
-    if(!isAndroid){
-      // Su desktop/iOS il pause() nativo funziona correttamente
-      mediaRecorder.pause();
-    }
-    // Su Android: lasciamo girare il MediaRecorder silenziosamente
+    try{mediaRecorder.pause();}catch(e){}
   }
   stopTimer();
   if(livePreview.trim()){
@@ -1415,21 +1446,8 @@ function pauseRecord(){
 
 function resumeRecord(){
   micState='recording';
-  // FIX ANDROID: il MediaRecorder non è stato fermato durante la pausa → riprendo solo il timer
-  if(isAndroid){
-    // MediaRecorder è già attivo, non serve ricreare nulla
-    if(mediaRecorder&&mediaRecorder.state==='inactive'&&micStream&&micStream.active){
-      // Caso limite: il recorder si è fermato per qualche motivo → ricrea
-      const mime=getBestMime();
-      try{mediaRecorder=new MediaRecorder(micStream,mime?{mimeType:mime}:{});}
-      catch(e){mediaRecorder=new MediaRecorder(micStream);}
-      mediaRecorder.ondataavailable=e=>{if(e.data&&e.data.size>0)audioChunks.push(e.data);};
-      mediaRecorder.onerror=()=>{showToast('Errore registrazione — riprova','err');stopRecord();};
-      mediaRecorder.start(250);
-    }
-    // Se è ancora 'recording' non facciamo nulla (era solo una pausa UI)
-  }else{
-    if(mediaRecorder&&mediaRecorder.state==='paused')mediaRecorder.resume();
+  if(mediaRecorder&&mediaRecorder.state==='paused'){
+    try{mediaRecorder.resume();}catch(e){}
   }
   startTimer();
   startWebSpeechPreview();
@@ -1444,19 +1462,30 @@ function stopRecord(){
 
   const finalize=()=>{
     if(micStream)micStream.getTracks().forEach(t=>t.stop());
-    // Piccolo delay su Android per assicurarci che tutti i chunk siano arrivati
-    setTimeout(()=>autoTranscribeWithWhisper(), isAndroid?300:0);
+    // Delay su Android: alcuni dispositivi rilasciano l'ultimo blob in ritardo
+    setTimeout(()=>autoTranscribeWithWhisper(), isAndroid?400:50);
   };
 
   if(mediaRecorder&&mediaRecorder.state!=='inactive'){
     mediaRecorder.onstop=finalize;
-    mediaRecorder.stop();
+    try{
+      // Forza il rilascio di tutto il buffer audio PRIMA di stop().
+      // Cruciale su Android dove stop() da solo a volte perde l'ultimo segmento.
+      if(mediaRecorder.state==='paused'){try{mediaRecorder.resume();}catch(e){}}
+      if(typeof mediaRecorder.requestData==='function'){
+        try{mediaRecorder.requestData();}catch(e){}
+      }
+      mediaRecorder.stop();
+    }catch(e){
+      console.error('stop() error:',e);
+      finalize();
+    }
   }else{
     finalize();
   }
   releaseWakeLock();
   stopTimer();
-  document.getElementById('btnStop').disabled=true;
+  const bs=document.getElementById('btnStop');if(bs)bs.disabled=true;
   updateRecUI();
   setStatus('done','Elaborazione AI…');
 }
@@ -1511,24 +1540,38 @@ async function autoTranscribeWithWhisper(){
   }
 
   const totalSize=audioChunks.reduce((s,c)=>s+c.size,0);
-  if(totalSize<3000){
+  if(totalSize<2000){
     if(livePreview.trim()){transcript=livePreview.trim();renderTranscript(transcript,'');setStatus('done','Trascritto (live)');}
-    else{setStatus('','Pronto');showToast('Registrazione troppo breve');}
+    else{setStatus('','Pronto');showToast('Registrazione troppo breve — parla più a lungo');}
     audioChunks=[];return;
   }
 
   const statusEl=document.getElementById('transcribeStatus');
   if(statusEl)statusEl.style.display='flex';
 
-  // Determina mimeType reale dai chunk (su Android può differire da quello richiesto)
-  const actualMime=audioChunks[0]?.type||'audio/webm';
+  // mimeType reale dai chunk (su Android spesso differisce da quello richiesto)
+  const actualMime=(audioChunks[0]&&audioChunks[0].type)||'audio/webm';
   const cleanMime=actualMime.split(';')[0]||'audio/webm';
   const ext=mimeToExt(cleanMime);
 
-  // Crea blob con mimeType esplicito
   const blob=new Blob(audioChunks,{type:cleanMime||'audio/webm'});
 
-  console.log(`[Whisper] blob: ${blob.size} bytes, type: ${blob.type}, ext: ${ext}`);
+  console.log(`[Whisper] blob ${blob.size}B type=${blob.type} ext=${ext} chunks=${audioChunks.length} android=${isAndroid}`);
+
+  // GUARD: blob troppo piccolo rispetto alla durata = registrazione corrotta.
+  // Meglio usare subito il fallback live che mandare a Whisper un file rotto.
+  if(blob.size<1500){
+    if(livePreview.trim()){
+      transcript=livePreview.trim();renderTranscript(transcript,'');
+      setStatus('done','Trascritto (live)');
+      showToast('Audio non valido — usato testo live');
+    }else{
+      setStatus('','Pronto');
+      showToast('Registrazione non riuscita — riprova tenendo premuto Stop più a lungo','err');
+    }
+    if(statusEl)statusEl.style.display='none';
+    audioChunks=[];return;
+  }
 
   let lastErr=null;
   for(let attempt=1;attempt<=3;attempt++){
@@ -3248,7 +3291,16 @@ async function loadAdminData(){
   // Online ora (RTDB — pubblicamente leggibile)
   rtdb.ref('presence').once('value',snap=>{
     const el=document.getElementById('adminStatOnline');
-    if(el)el.textContent=snap.val()?Object.keys(snap.val()).length:0;
+    if(!el)return;
+    const data=snap.val()||{};
+    const now=Date.now();let count=0;
+    Object.keys(data).forEach(k=>{
+      const v=data[k];const ts=v&&typeof v.ts==='number'?v.ts:now;
+      if(now-ts<120000)count++;
+    });
+    el.textContent=count;
+  },err=>{
+    const el=document.getElementById('adminStatOnline');if(el)el.textContent='—';
   });
 
   // Pomodori totali — leggibili da tutti gli utenti autenticati
