@@ -2975,13 +2975,32 @@ function updateMicAnimation(){
 </div>
 
 <script>
-// ═══ SERVICE WORKER (modalità offline) ═══
+// ═══ SERVICE WORKER (modalità offline + auto-aggiornamento) ═══
 if('serviceWorker' in navigator){
+  let refreshing=false;
+  // Quando il nuovo service worker prende il controllo, ricarica UNA volta
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+    if(refreshing)return;
+    refreshing=true;
+    window.location.reload();
+  });
   navigator.serviceWorker.register('/sw.js').then(reg=>{
+    // Controlla aggiornamenti ad ogni avvio e ogni volta che la app torna in primo piano
+    reg.update().catch(()=>{});
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='visible')reg.update().catch(()=>{});
+    });
+    function promptActivate(worker){
+      // Attiva subito il nuovo SW senza aspettare la chiusura delle schede
+      showToast('Aggiornamento in corso…');
+      worker.postMessage({type:'SKIP_WAITING'});
+    }
+    // Se c'è già un SW in attesa al caricamento
+    if(reg.waiting&&navigator.serviceWorker.controller)promptActivate(reg.waiting);
     reg.addEventListener('updatefound',()=>{
-      reg.installing?.addEventListener('statechange',e=>{
-        if(e.target.state==='installed'&&navigator.serviceWorker.controller)
-          showToast('Aggiornamento disponibile! Ricarica la pagina.');
+      const nw=reg.installing;
+      nw?.addEventListener('statechange',()=>{
+        if(nw.state==='installed'&&navigator.serviceWorker.controller)promptActivate(nw);
       });
     });
   }).catch(()=>{});
