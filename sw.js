@@ -5,7 +5,7 @@
 //  versione qui sotto (es. v3, v4...). È questo cambiamento che dice
 //  al browser "c'è una versione nuova, scaricala".
 // ═══════════════════════════════════════════════════════════════════
-const VERSION = 'edunity-v6.5';
+const VERSION = 'edunity-v6.6';
 const CACHE = VERSION;
 
 // File di base da avere disponibili offline
