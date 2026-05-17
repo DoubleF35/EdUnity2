@@ -1,0 +1,23 @@
+User-agent: *
+Allow: /
+
+# Blocca i crawler da URL dinamici che richiedono auth o stato di sessione
+Disallow: /?share=
+Disallow: /?ml=
+Disallow: /?debug=
+Disallow: /?finishMagicLink=
+
+# Esclude i provider AI dal training (opzionale, etico)
+User-agent: GPTBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+Sitemap: https://edunityedu.it/sitemap.xml
